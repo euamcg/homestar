@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use assert_cmd::{crate_name, prelude::*};
+#[cfg(not(windows))]
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -9,13 +10,12 @@ use predicates::prelude::*;
 use retry::{delay::Fixed, retry};
 use serial_test::serial;
 use std::{
-    fs,
     net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr, TcpStream},
     path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
 };
-use sysinfo::{PidExt, ProcessExt, SystemExt};
+use sysinfo::{ProcessExt, SystemExt};
 use wait_timeout::ChildExt;
 
 static BIN: Lazy<PathBuf> = Lazy::new(|| assert_cmd::cargo::cargo_bin(crate_name!()));
@@ -80,6 +80,7 @@ fn test_version_serial() -> Result<()> {
 
 #[test]
 #[serial]
+#[cfg(not(windows))]
 fn test_server_not_running_serial() -> Result<()> {
     let _ = stop_bin();
 
@@ -123,6 +124,7 @@ fn test_server_not_running_serial() -> Result<()> {
 
 #[test]
 #[serial]
+#[cfg(not(windows))]
 fn test_server_serial() -> Result<()> {
     let _ = stop_bin();
 
@@ -185,6 +187,7 @@ fn test_server_serial() -> Result<()> {
 #[cfg(feature = "test-utils")]
 #[test]
 #[serial]
+#[cfg(not(windows))]
 fn test_workflow_run_serial() -> Result<()> {
     let _ = stop_bin();
 
@@ -257,6 +260,9 @@ fn test_workflow_run_serial() -> Result<()> {
 #[serial]
 #[cfg(not(windows))]
 fn test_daemon_serial() -> Result<()> {
+    use std::fs;
+    use sysinfo::PidExt;
+
     let _ = stop_bin();
 
     Command::new(BIN.as_os_str())
@@ -306,6 +312,196 @@ fn test_daemon_serial() -> Result<()> {
     });
 
     let _ = stop_bin();
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg(windows)]
+fn test_server_not_running_serial_windows() -> Result<()> {
+    let _ = stop_bin();
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No connection could be made"));
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .arg("--host")
+        .arg("::1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No connection could be made"));
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .arg("--host")
+        .arg("::2")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unreachable network"));
+
+    Command::new(BIN.as_os_str())
+        .arg("stop")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No connection could be made"));
+    let _ = stop_bin();
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg(windows)]
+fn test_server_serial_windows() -> Result<()> {
+    let _ = stop_bin();
+
+    Command::new(BIN.as_os_str())
+        .arg("start")
+        .arg("-db")
+        .arg("homestar.db")
+        .assert()
+        .failure();
+
+    let mut homestar_proc = Command::new(BIN.as_os_str())
+        .arg("start")
+        .arg("--db")
+        .arg("homestar.db")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let socket = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3030);
+    let result = retry(Fixed::from_millis(500), || {
+        TcpStream::connect(socket).map(|stream| stream.shutdown(Shutdown::Both))
+    });
+
+    if result.is_err() {
+        homestar_proc.kill().unwrap();
+        panic!("Homestar server/runtime failed to start in time");
+    }
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("::1"))
+        .stdout(predicate::str::contains("pong"));
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .arg("-p")
+        .arg("9999")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No connection could be made"));
+
+    let _ = Command::new(BIN.as_os_str()).arg("stop").output();
+
+    if let Ok(None) = homestar_proc.try_wait() {
+        let _status_code = match homestar_proc.wait_timeout(Duration::from_secs(1)).unwrap() {
+            Some(status) => status.code(),
+            None => {
+                homestar_proc.kill().unwrap();
+                homestar_proc.wait().unwrap().code()
+            }
+        };
+    }
+    let _ = stop_bin();
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg(windows)]
+fn test_windows_signal_kill() -> Result<()> {
+    let _ = stop_bin();
+
+    Command::new(BIN.as_os_str())
+        .arg("start")
+        .arg("--db")
+        .arg("homestar.db")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let system = sysinfo::System::new_all();
+    let pid = system
+        .processes_by_exact_name("homestar-runtime.exe")
+        .collect::<Vec<_>>()
+        .first()
+        .map(|x| x.pid())
+        .unwrap();
+
+    let socket = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3030);
+    let result = retry(Fixed::from_millis(500), || {
+        TcpStream::connect(socket).map(|stream| stream.shutdown(Shutdown::Both))
+    });
+
+    if result.is_err() {
+        panic!("Homestar server/runtime failed to start in time");
+    }
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("::1"))
+        .stdout(predicate::str::contains("pong"));
+
+    if let Some(process) = system.process(pid) {
+        process.kill();
+    };
+
+    Command::new(BIN.as_os_str()).arg("ping").assert().failure();
+    let _ = stop_bin();
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg(windows)]
+fn test_server_serial_windows_v4() -> Result<()> {
+    use std::net::Ipv4Addr;
+
+    let _ = stop_bin();
+
+    let mut homestar_proc = Command::new(BIN.as_os_str())
+        .arg("start")
+        .arg("-c")
+        .arg("fixtures/test_windows_v4.toml")
+        .arg("--db")
+        .arg("homestar.db")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+    let result = retry(Fixed::from_millis(500), || {
+        TcpStream::connect(socket).map(|stream| stream.shutdown(Shutdown::Both))
+    });
+
+    if result.is_err() {
+        homestar_proc.kill().unwrap();
+        panic!("Homestar server/runtime failed to start in time");
+    }
+
+    Command::new(BIN.as_os_str())
+        .arg("ping")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("-p")
+        .arg("9999")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("127.0.0.1"))
+        .stdout(predicate::str::contains("pong"));
 
     Ok(())
 }
